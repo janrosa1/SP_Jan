@@ -157,6 +157,29 @@ function mc_sample_path(P; init = 11, sample_size = 11000) #Simulate the Markov 
     return SIM
 end
 
+
+function bisection(f::Function, a::Number, b::Number;
+    tol::AbstractFloat=1e-7, maxiter::Integer=100)
+fa = f(a)
+fa*f(b) <= 0 || error("No real root in [a,b]")
+i = 0
+local c
+while b-a > tol
+i += 1
+i != maxiter || error("Max iteration exceeded")
+c = (a+b)/2
+fc = f(c)
+if fc == 0
+break
+elseif fa*fc > 0
+a = c  # Root is in the right half of [a,b].
+fa = fc
+else
+b = c  # Root is in the left half of [a,b].
+end
+end
+return c
+end
 #simulate if the country continue to be exclulded after default
 function simulate_exclusion(θ)
     dists = Categorical([θ , 1.0- θ])
@@ -185,6 +208,41 @@ function interp_alg_unconst(splines_v, spline_q, state_y,state_b,b)
         c_t = 1e-8
     end
 
+    #compute the  consumption with b
+    c = final_good(c_t, c_n)
+    val =0.0
+    val = copy(utilityCRRA(c))
+
+    #compute the next period's values
+    for j in 1:n_y
+        v_p = splines_v[j]
+        v_b = β*P_stat[state_y, j]*v_p(b)
+        val = copy(val) + v_b
+    end
+    return -1.0*val #minimizing function, so need a negative value 
+end
+
+function interp_alg_const(splines_v, spline_q, state_y,state_b,b) 
+    
+    """
+    interpolate the value of choosing debt b, given:
+    value functions (splines_v),
+    price function (spline_q),
+    endowment: state_y
+    current debt: state_b    
+    """
+    const_w = (α*(1.0-a)/a/w_bar)^(1.0/(1.0/ζ - (1.0-α)/α))
+    power = copy(1.0/ζ/(1.0/ζ - (1.0-α)/α))
+    q_b = max(spline_q(b), 0.0) #compute debt price
+    if b<=0
+        q_b =1.0/(1.0+r)
+    end
+
+    c_t = -state_b + y_t_stat[state_y] +q_b*b #compute tradeable consumption (check if it's >=0)
+    if(c_t<=0)
+        c_t = 1e-8
+    end
+    c_n = max(min(const_w*copy(c_t)^power,1.0),1e-7)
     #compute the  consumption with b
     c = final_good(c_t, c_n)
     val =0.0
@@ -375,6 +433,139 @@ function Vf_update_TD_float_spline(V_f, q; spline_type = "spline_sch")
 end
 
 
+function Vf_update_TD_peg_spline(V_f, q; spline_type = "spline_sch") 
+    """
+    INPUTS
+    V_f: current value function
+    q: current price function, 
+
+    OUTPUTS:
+    V_final: value function after update
+    Default_mat: default region matrix
+    Policy: policy matrix (chosen debt index)
+    
+    OPTIONAL:
+
+    spline_type: choose cubic or schumker splines
+    """
+
+
+    E_V_f_prim = zeros(n_y) #expected value next period for continuation
+    E_V_f_prim_default  =  zeros(n_y) #expected value next period for default
+    V_final = zeros(n_y,n_B) #final value function after update
+    V_f_prim = zeros(n_y, n_B) #value for continuation
+    V_def = zeros(n_y) #value of default
+    Default_mat = zeros(n_y, n_B) #default decsion
+    Dafault_border = zeros(n_y) #exact location when the default occurs
+    Policy_num = zeros(n_y,n_B) #next period policies 
+    C_n_vec_def = ones(n_y) # vector of tradeable consumption in 
+
+
+    #choose the spline type, define the value function interpolations matrix for each endomwnet schock
+    if(spline_type == "spline_cub")
+        V_f_spline = Array{Interpolations.Extrapolation}(undef,n_y)
+        q_spline = Array{Interpolations.Extrapolation}(undef,n_y)
+        for j in 1:n_y
+            V_f_spline[j] = CubicSplineInterpolation(grid_B, V_f[j,:],extrapolation_bc = Line())
+            q_spline[j] = LinearInterpolation(grid_B, q[j,:]) #spline works very bad for the price function (as they are non-monotonic)
+        end
+    else
+        V_f_spline = Array{Schumaker{Float64}}(undef,n_y)
+        q_spline = Array{Schumaker{Float64}}(undef,n_y)
+        for j in 1:n_y
+            V_f_spline[j] = Schumaker(collect(grid_B), V_f[j,:]; extrapolation = (SchumakerSpline.Linear, SchumakerSpline.Linear))
+            q_spline[j] = Schumaker(collect(grid_B), q[j,:]; extrapolation = (SchumakerSpline.Linear, SchumakerSpline.Linear)) #schumker splines preserves monotonicity
+        end
+
+    end
+
+    # Given value functions and price functions find updated value function, this step can be done muchg faster but this more stable
+    for j in 1:n_y
+        sol_max_qB = optimize(x-> -q_spline[j](x)*x,grid_B[1], grid_B[n_B], GoldenSection())
+        max_qB = Optim.minimizer(sol_max_qB)[1]
+
+        for i in 1:n_B
+            if(y_t_stat[j]-grid_B[i]+ q_spline[j](grid_B[1])*grid_B[1]<c_t_min) && (y_t_stat[j]-grid_B[i]+ q_spline[j](max_qB)*max_qB>c_t_min)
+                #println((y_t_stat[j]-grid_B[i]+ q_spline[j](grid_B[1])*grid_B[1]-c_t_min)*(y_t_stat[j]-grid_B[i]+ q_spline[j](max_qB)*max_qB-c_t_min))
+                b_bord = copy(find_zero(x->y_t_stat[j]-grid_B[i]+ q_spline[j](x)*x - c_t_min, (grid_B[1],max_qB)))
+                #b_bord = bisection(x->y_t_stat[j]-grid_B[i]+ q_spline[j](x)*x - c_t_min,grid_B[1],  max_qB)
+                interp_alg_unconst_1(x) = deepcopy(interp_alg_unconst(copy(V_f_spline), q_spline[j], j ,grid_B[i],x))
+                interp_alg_const_1(x) = deepcopy(interp_alg_const(copy(V_f_spline), q_spline[j], j ,grid_B[i],x))
+                    
+                next_b_sol_unconst = optimize(interp_alg_unconst_1,b_bord, grid_B[n_B], GoldenSection())#find the optimal value, Golden section is slower but more stable than Brent method 
+                Optim.converged(next_b_sol_unconst) || error("Failed to converge in $(iterations(result)) iterations")
+                next_b_sol_const = optimize(interp_alg_const_1,grid_B[1],b_bord, GoldenSection())#find the optimal value, Golden section is slower but more stable than Brent method 
+                Optim.converged(next_b_sol_const) || error("Failed to converge in $(iterations(result)) iterations")
+                if(Optim.minimum(next_b_sol_unconst)< Optim.minimum(next_b_sol_const))
+                        V_f_prim[j,i] = max(-1.0*deepcopy(Optim.minimum(next_b_sol_unconst)), -1000)
+                        Policy_num[j,i] = deepcopy(Optim.minimizer(next_b_sol_unconst)[1])
+                else
+                        V_f_prim[j,i] = max(-1.0*deepcopy(Optim.minimum(next_b_sol_const)), -1000)
+                        Policy_num[j,i] = deepcopy(Optim.minimizer(next_b_sol_const)[1])
+                end
+            elseif y_t_stat[j]-grid_B[i]+ q_spline[j](max_qB)*max_qB<c_t_min
+                interp_alg_const_2(x) = deepcopy(interp_alg_const(copy(V_f_spline), q_spline[j], j ,grid_B[i],x))
+                next_b_sol_const = optimize(interp_alg_const_2,grid_B[1],grid_B[n_B], GoldenSection())#find the optimal value, Golden section is slower but more stable than Brent method 
+                Optim.converged(next_b_sol_const) || error("Failed to converge in $(iterations(result)) iterations")
+                V_f_prim[j,i] = max(-1.0*deepcopy(Optim.minimum(next_b_sol_const)), -1000)
+                Policy_num[j,i] = deepcopy(Optim.minimizer(next_b_sol_const)[1])
+    
+            else
+                interp_alg_unconst_3(x) = deepcopy(interp_alg_unconst(copy(V_f_spline), q_spline[j], j ,grid_B[i],x)) #define the value of choosing the debt x as function of 1 variable
+                next_b_sol = optimize(interp_alg_unconst_3,grid_B[1], grid_B[n_B], GoldenSection())#find the optimal value, Golden section is slower but more stable than Brent method 
+                Optim.converged(next_b_sol) || error("Failed to converge in $(iterations(result)) iterations")
+                V_f_prim[j,i] = max(-1.0*deepcopy(Optim.minimum(next_b_sol)), -1000) #find new value of continuation 
+                Policy_num[j,i] = deepcopy(Optim.minimizer(next_b_sol)[1]) #find policy if continuation 
+            end
+
+            
+            
+        end
+    end
+    const_w = (α*(1.0-a)/a/w_bar)^(1.0/(1.0/ζ - (1.0-α)/α))
+    power = copy(1.0/ζ/(1.0/ζ - (1.0-α)/α))
+    #compute the expectation of V_f for reentring the international market after default
+     for j in 1:n_y
+         futur_val = copy(0.0)
+         E_V_f_prim_default[j] = copy(V_f_spline[j](0.0))
+         for jj in 1: n_y
+             futur_val = copy(futur_val)+P_stat[j,jj]*V_f_spline[jj](0.0) 
+         end
+         E_V_f_prim[j] = copy(futur_val)
+     end
+    
+     for j in 1:n_y
+        if(y_t_stat[j]-L(y_t_stat[j]) <c_t_min)
+            C_n_vec_def[j] = min(copy(y_t_stat[j]-L.(y_t_stat[j]))^(power)*const_w,1.0)
+        end
+    end
+    #compute default value
+    V_def = (I(n_y) - β*(1.0-θ)*P_stat)\(utilityCRRA.(final_good.(max.(y_t_stat-L.(y_t_stat),1e-8),C_n_vec_def)) + β*θ*copy(E_V_f_prim)) 
+    #Choose over default and continuation 
+    V_final  = V_f_prim
+    for j in 1: n_y
+        #interpolate continuation value
+        if(spline_type == "spline_cub")
+            V_prim_itp = CubicSplineInterpolation(grid_B, V_f_prim[j,:].- V_def[j],extrapolation_bc = Line()) 
+        else
+            V_prim_itp = Schumaker(collect(grid_B), V_f_prim[j,:].- V_def[j]; extrapolation = (SchumakerSpline.Linear, SchumakerSpline.Linear))
+        end
+
+        if(V_f_prim[j,n_B]<V_def[j])
+            Dafault_border[j] = find_zero(V_prim_itp, (grid_B[1],grid_B[n_B] ),Roots.Brent() )
+        else
+            Dafault_border[j] = grid_B[n_B]+0.2 #never will be chosen
+        end
+        for i in 1:n_B #small mistaekes in Brent methd can make convergence impossible on some inital iterations, so I compute this independly, though it should get to the same result
+           if(V_f_prim[j,i]< V_def[j] && grid_B[i]> 0.0) 
+              Default_mat[j,i] = 1.0 
+              V_final[j,i] = V_def[j]
+            end
+         end
+    end
+    return V_final, Default_mat,Policy_num,Dafault_border
+end
+
 function Solve_Bellman_float(n, method = "spline_sch")
     """
     solve Bellman equation for float, given maximal number of iterations n 
@@ -436,6 +627,11 @@ function Solve_Bellman_float(n, method = "spline_sch")
         end
     end
     
+    println("ITERATION ends at: ")
+    println("Iteration: ", iter)
+    println("V_f conv: ",maximum(abs.(V_f_new-V_f)))   
+    println("q conv: ",maximum(abs.(copy(q).-copy(q_new)))) 
+
     if method =="vfi"
         for j in 1:n_y
             for i in 1:n_B
@@ -449,6 +645,88 @@ function Solve_Bellman_float(n, method = "spline_sch")
     return (q, Default_mat, Policy, Policy_c_n, V_f, default_border)
 end
 
+
+function Solve_Bellman_peg(n, method = "spline_sch")
+    """
+    solve Bellman equation for float, given maximal number of iterations n 
+    """
+    global c_t_min = (copy(w_bar)/(copy(α)*(1-copy(a))/copy(a)))^(ζ)
+
+    V_f = zeros(n_y,n_B)
+    q = 1.0/(1.0+r)*ones(n_y, n_B)
+    for i in 1:n_B
+        V_f[:,i] = utilityCRRA.(final_good.(max.(y_t_stat,1e-7),ones(n_y)))
+    end
+    #check size of the asset and income grids 
+    δ = zeros(n_y, n_B) #default probability
+    q_new = ones(n_y, n_B) #new q price matrix
+    #Allocate memory
+    V_f_new  = zeros(n_y, n_B) #
+    V_f_def  = zeros(n_y) #
+    V_f_def_new = zeros(n_y)
+    Default_mat = zeros(n_y, n_B)
+    Policy = zeros(n_y, n_B)
+    Policy_index = zeros(n_y, n_B)
+    default_border = zeros(Int64, n_y)
+    Policy_c_n = ones(n_y,n_B)   
+    #initialize iterations
+    iter = 0
+    
+    
+    while((maximum(abs.(V_f_new-V_f).+abs.(V_f_def-V_f_def_new) )>=1e-6 || maximum(abs.(q_new-q))>=1e-8)&& iter <n ) #for now I want the solution to converge with 1e-6  
+        
+        if(iter >=1)
+         V_f = copy(V_f_new) 
+         q = copy(q_new)
+         V_f_def = copy(V_f_def_new)
+        end
+        if method == "vfi" 
+            V_f_new, Default_mat, Policy_index = Vf_update_TD_float( V_f, q)
+        else 
+            V_f_new, Default_mat, Policy, default_border = Vf_update_TD_peg_spline( V_f, q, spline_type = method)
+        end
+         #compute default probability
+        for j in 1:n_y
+            for i in 1:n_B
+                default_prob = 0.0
+                for jj in 1:n_y
+                    default_prob = copy(default_prob) + P_stat[j,jj]*Default_mat[jj,i]
+                end
+                δ[j,i] = copy(default_prob)
+                        
+                
+                
+            end
+        end
+        
+        #update the q
+        q_new = 0.99*(1.0/(1.0+r)*(1.0.-copy(δ)))+0.01*copy(q)
+        iter = iter+1
+        if(mod(iter, 10)==0)
+            println("Iteration: ", iter)
+            println("V_f conv: ",maximum(abs.(V_f_new-V_f)))   
+            println("q conv: ",maximum(abs.(copy(q).-copy(q_new))))   
+        end
+    end
+
+    println("ITERATION ends at: ")
+    println("Iteration: ", iter)
+    println("V_f conv: ",maximum(abs.(V_f_new-V_f)))   
+    println("q conv: ",maximum(abs.(copy(q).-copy(q_new)))) 
+
+
+    if method =="vfi"
+        for j in 1:n_y
+            for i in 1:n_B
+                Policy[j,i] = grid_B[Policy_index[j,i]]
+            end
+            default_border[j] = searchsortedfirst(Default_mat[j,:],1)
+        end
+    end
+
+
+    return (q, Default_mat, Policy, Policy_c_n, V_f, default_border)
+end
 ########################################################
 ## SImulate equilibrium
 ########################################################
@@ -487,6 +765,7 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
     
     C_t = zeros(n_sim, t_sim) # consumption history tradeables
     C_n = ones(n_sim, t_sim) # non-tradeables
+    h_t = ones(n_sim, t_sim)
     C = zeros(n_sim, t_sim) # final good
     
     D = zeros(n_sim, t_sim) #Defaults histiry
@@ -496,7 +775,8 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
     #exchange rate and minimal wage
    
     ϵ = ones(n_sim, t_sim)
-    
+    const_w = (α*(1.0-a)/a/w_bar)^(1.0/(1.0/ζ - (1.0-α)/α))
+    power = copy(1.0/ζ/(1.0/ζ - (1.0-α)/α))
    
     #interpolate policy functions
     if method == "spline_cub"
@@ -556,7 +836,8 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
                     Y_t[i,t] = y_t_stat[SIM[i,t]]- L(y_t_stat[SIM[i,t]])
                     C_t[i,t] = Y_t[i,t] 
                     if C_t[i,t] < c_t_min && ERR =="peg"
-                        C_n[i,t] =  min((C_t[i,t]^(1.0/ζ)/α/w_bar)^(α*(1.0+1.0/ζ-α)),1.0)
+                        C_n[i,t] =  min(copy(C_t[i,t])^(power)*const_w,1.0)
+                        h_t[i,t] = C_n[i,t]^(1.0/α)
                     else
                         C_n[i,t] = 1.0
                     end
@@ -573,7 +854,8 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
                     A[i,t] = Policy_fun[SIM[i,t]](0.0)
                     C_t[i,t] = Y_t[i,t] - A[i,t-1] + q_func[SIM[i,t]](0.0)*A[i,t]
                     if C_t[i,t] < c_t_min && ERR =="peg"
-                        C_n[i,t] =  min((C_t[i,t]^(1.0/ζ)/α/w_bar)^(α*(1.0+1.0/ζ-α)),1.0)
+                        C_n[i,t] =  min(copy(C_t[i,t])^(power)*const_w,1.0)
+                        h_t[i,t] = C_n[i,t]^(1.0/α)
                     else
                         C_n[i,t] = 1.0
                     end
@@ -591,7 +873,8 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
                     C_t[i,t] = Y_t[i,t]
                     C[i,t] = final_good(C_t[i,t],1.0) 
                     if C_t[i,t] < c_t_min && ERR =="peg"
-                        C_n[i,t] =  min((C_t[i,t]^(1.0/ζ)/α/w_bar)^(α*(1.0+1.0/ζ-α)),1.0)
+                        C_n[i,t] =  min(copy(C_t[i,t])^(power)*const_w,1.0)
+                        h_t[i,t] = C_n[i,t]^(1.0/α)
                     else
                         C_n[i,t] = 1.0
                     end
@@ -607,7 +890,8 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
                     A[i,t] = Policy_fun[SIM[i,t]](A[i,t-1])
                     C_t[i,t] = Y_t[i,t] - A[i,t-1] + q_func[SIM[i,t]](A[i,t])*A[i,t]
                     if C_t[i,t] < c_t_min && ERR =="peg"
-                        C_n[i,t] =  min((C_t[i,t]^(1.0/ζ)/α/w_bar)^(α*(1.0+1.0/ζ-α)),1.0)
+                        C_n[i,t] =  min(copy(C_t[i,t])^(power)*const_w,1.0)
+                        h_t[i,t] = C_n[i,t]^(1.0/α)
                     else
                         C_n[i,t] = 1.0
                     end
@@ -644,8 +928,9 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
     D_state_ab = D_state[:,burnout:t_sim]
     C_ab_t = C_t[:,burnout:t_sim]
     C_ab_n = C_n[:,burnout:t_sim]
+    h_t_ab = h_t[:,burnout:t_sim]
     #choose number of defaults to compute statistics 
-    n_chosen_def = 1000
+    n_chosen_def = 10000
     #allocate memory for the staoistics 
     pre_def_stats_Y_t = zeros(n_chosen_def , 90)
     pre_def_stats_R = zeros(n_chosen_def , 90)        
@@ -656,7 +941,8 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
     pre_def_stats_NB = zeros(n_chosen_def , 90)  
     pre_def_stats_P = zeros(n_chosen_def , 90)  
     pre_def_stats_D = zeros(n_chosen_def , 90) 
-    stats = zeros(8, 90)
+    pre_def_stats_h = zeros(n_chosen_def , 90) 
+    stats = zeros(9, 90)
     ϵ_stats = zeros(n_chosen_def , 90)  
     
     
@@ -676,6 +962,7 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
                  pre_def_stats_C_n[iter,:] = C_ab_n[i, t-74:t+15]
                  pre_def_stats_P[iter,:] = (1-a)/a*(pre_def_stats_C_t[iter,:]./pre_def_stats_C_n[iter,:])
                  ϵ_stats[iter, :] = ϵ_ab[i, t-74:t+15] 
+                 pre_def_stats_h[iter,:] = h_t_ab[i, t-74:t+15] 
                  pre_def_stats_D[iter,:] =  D_state[i, t-74:t+15]
                 
             end 
@@ -698,6 +985,7 @@ function simulate_TD( Model_solution, w_bar; burnout = 10000, t_sim =1010000, n_
     
     stats[7,:] = median(pre_def_stats_P, dims = 1)
     stats[8,:] = mean(pre_def_stats_D, dims = 1)
+    stats[9,:] = median(pre_def_stats_h, dims = 1)
     output_loss = mean((pre_def_stats_Y_t[:,75].- pre_def_stats_Y_t[:,74])./(pre_def_stats_Y_t[:,74]))
     println("calibration results: ", " default probability: ", Def_prob)       
     println("prod_loss: " , output_loss)      
@@ -793,8 +1081,11 @@ function plot_simulation(stats)
     p2 = plot(-15.0:1.0:14.0,stats[1,60:89], ylabel = "Y_t", xlabel = "T")
     p3 = plot(-15.0:1.0:14.0, stats[7,60:89], ylabel = "P_n/P_t", xlabel = "T")
     p4 = plot(-15.0:1.0:14.0, stats[4,60:89], ylabel = "C_t", xlabel = "T")
-    plot(p1,p2, p3,p4,layout = (2, 2))
-    png("output/pre_def_stats")
+    p5 = plot(-15.0:1.0:14.0, stats[6,60:89], ylabel = "C_n'", xlabel = "T")
+    p6 = plot(-15.0:1.0:14.0,stats[9,60:89], ylabel = "h", xlabel = "T")
+    
+    plot(p1,p2, p3,p4,p5, p6, layout = (3, 2))
+    png("output/pre_def_stats_1")
 
     writedlm( "output/results_pre_def.csv",  stats, ',')
 
@@ -808,11 +1099,17 @@ function run_spline(non_calib::TD_assumed,calib::TD_calib, grid_param::TD_gird;E
 
     unpack_params(non_calib, calib,grid_param )
     global P_stat, y_t_stat = DiscretizeAR(ρ, σ_μ, n_y, disc)
-
-    Model_sol = Solve_Bellman_float(600)
-    println("Siumulations starts")
-    pd, dt, loss, stats = simulate_TD(Model_sol, w_bar)
-
+    if(ERR == "float")
+        Model_sol = Solve_Bellman_float(600)
+        println("Siumulations starts")
+        pd, dt, loss, stats = simulate_TD(Model_sol, w_bar, ERR="float")
+    elseif(ERR == "peg")
+        Model_sol = Solve_Bellman_peg(600)
+        println("Siumulations starts")
+        pd, dt, loss, stats = simulate_TD(Model_sol, w_bar, ERR="peg")
+    else
+        throw(DomainError(method, "this exchange rate regime is not supported, try float or peg "))
+    end
     plot_solution(Model_sol)
     plot_simulation(stats)
     
