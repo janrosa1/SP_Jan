@@ -566,7 +566,7 @@ function Vf_update_TD_peg_spline(V_f, q; spline_type = "spline_sch")
     return V_final, Default_mat,Policy_num,Dafault_border
 end
 
-function Solve_Bellman_float(n, method = "spline_sch")
+function Solve_Bellman_float(n; method = "spline_sch")
     """
     solve Bellman equation for float, given maximal number of iterations n 
     """
@@ -646,7 +646,7 @@ function Solve_Bellman_float(n, method = "spline_sch")
 end
 
 
-function Solve_Bellman_peg(n, method = "spline_sch")
+function Solve_Bellman_peg(n; method = "spline_sch")
     """
     solve Bellman equation for float, given maximal number of iterations n 
     """
@@ -1100,11 +1100,11 @@ function run_spline(non_calib::TD_assumed,calib::TD_calib, grid_param::TD_gird;E
     unpack_params(non_calib, calib,grid_param )
     global P_stat, y_t_stat = DiscretizeAR(ρ, σ_μ, n_y, disc)
     if(ERR == "float")
-        Model_sol = Solve_Bellman_float(600)
+        Model_sol = Solve_Bellman_float(600, method = itp)
         println("Siumulations starts")
         pd, dt, loss, stats = simulate_TD(Model_sol, w_bar, ERR="float")
     elseif(ERR == "peg")
-        Model_sol = Solve_Bellman_peg(600)
+        Model_sol = Solve_Bellman_peg(600, method = itp)
         println("Siumulations starts")
         pd, dt, loss, stats = simulate_TD(Model_sol, w_bar, ERR="peg")
     else
